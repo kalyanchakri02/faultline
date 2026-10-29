@@ -32,36 +32,54 @@ def check(kind: str, code: str, text: str) -> dict:
     return {**v, "data": r["data"]}
 
 class Library:
+    """Index of validated parsers (many per kind, so old and new formats can coexist) plus a lessons memory."""
     def __init__(self, path="library"):
         self.path = path; os.makedirs(path, exist_ok=True)
-        self.index_file = os.path.join(path, "index.json")
+        self.index_file = os.path.join(path, "index.json"); self.lessons_file = os.path.join(path, "lessons.json")
 
     def _load(self):
-        try: return json.load(open(self.index_file))
+        try: raw = json.load(open(self.index_file))
         except Exception: return {}
+        return {(e.get("name") or k): e for k, e in raw.items()} if any("|" in k for k in raw) else raw
+
+    def _store(self, idx):
+        tmp = self.index_file + ".tmp"; json.dump(idx, open(tmp, "w"), indent=1); os.replace(tmp, self.index_file)
 
     def entries(self): return self._load()
 
-    def lookup(self, kind, fp):
-        e = self._load().get(f"{kind}|{fp}")
-        if not e: return None
-        return {**e, "code": open(os.path.join(self.path, e["file"])).read()}
+    def candidates(self, kind, fp):
+        """Saved parsers of this kind. Exact-fingerprint matches first, then most-used. The fingerprint only ORDERS candidates;
+        the validator against the raw file decides which one is used."""
+        out = [{**e, "code": open(os.path.join(self.path, e["file"])).read()} for e in self._load().values() if e["kind"] == kind]
+        return sorted(out, key=lambda e: (e["fingerprint"] != fp, -e.get("uses", 0)))
 
-    def save(self, kind, fp, code, description):
+    def save(self, kind, fp, code, description, origin="learned", parent=None):
         with _LOCK:
-            idx = self._load(); key = f"{kind}|{fp}"
-            ver = idx.get(key, {}).get("version", 0) + 1
+            idx = self._load()
+            ver = 1
+            while f"{kind}_{hashlib.sha1(fp.encode()).hexdigest()[:8]}_v{ver}" in idx: ver += 1   # never overwrite an existing parser
             name = f"{kind}_{hashlib.sha1(fp.encode()).hexdigest()[:8]}_v{ver}"
             with open(os.path.join(self.path, name + ".py"), "w") as f: f.write(code)
-            idx[key] = {"kind": kind, "fingerprint": fp, "file": name + ".py", "name": name, "version": ver,
-                        "description": description[:200], "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "uses": idx.get(key, {}).get("uses", 0)}
-            tmp = self.index_file + ".tmp"; json.dump(idx, open(tmp, "w"), indent=1); os.replace(tmp, self.index_file)
+            idx[name] = {"kind": kind, "fingerprint": fp, "file": name + ".py", "name": name, "version": ver, "origin": origin, "parent": parent,
+                         "description": description[:200], "created": time.strftime("%Y-%m-%d %H:%M:%S"), "uses": 0}
+            self._store(idx)
         return name
 
-    def record_use(self, kind, fp):
+    def record_use(self, name):
         with _LOCK:
-            idx = self._load(); e = idx.get(f"{kind}|{fp}")
-            if e:
-                e["uses"] += 1
-                tmp = self.index_file + ".tmp"; json.dump(idx, open(tmp, "w"), indent=1); os.replace(tmp, self.index_file)
+            idx = self._load()
+            if name in idx: idx[name]["uses"] = idx[name].get("uses", 0) + 1; self._store(idx)
+
+    def lessons(self, kind, n=5):
+        try: ls = json.load(open(self.lessons_file))
+        except Exception: ls = []
+        return [l for l in ls if l["kind"] == kind][-n:]
+
+    def add_lesson(self, kind, fp, text):
+        with _LOCK:
+            try: ls = json.load(open(self.lessons_file))
+            except Exception: ls = []
+            if any(l["text"] == text for l in ls): return False
+            ls.append({"kind": kind, "fingerprint": fp, "text": text, "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+            tmp = self.lessons_file + ".tmp"; json.dump(ls, open(tmp, "w"), indent=1); os.replace(tmp, self.lessons_file)
+        return True

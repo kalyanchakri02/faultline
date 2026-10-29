@@ -6,12 +6,14 @@ from openai import OpenAI
 from pydantic import ValidationError
 import sandbox
 from parserlib import Library, FILES, fingerprint, check
+import review as rv
 from schemas import Report, XIDS
 
 BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/")
 DEFAULT_MODEL = os.environ.get("FAULTLINE_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 MAX_STEPS = 22
 MAX_PARSER_ATTEMPTS = 5
+MAX_CANDIDATES = 6   # saved parsers tried per file before the agent writes a new one
 
 SYSTEM = """You are FaultLine, an SRE agent that triages unhealthy NVIDIA GPU nodes. Input formats vary per node
 (syslog, journald ISO, journald JSON, CSV / JSONL / dmon-table telemetry), so you first make sure each raw file has a
@@ -24,7 +26,7 @@ robust to variations (extra spaces, missing optional fields, different hosts/ide
  kind='log': return one dict per line containing 'NVRM: Xid' (kind='xid'), 'AER:' (kind='aer') or 'clocks throttled' (kind='throttle'); skip all other lines.
    Keys: ts (ISO 'YYYY-MM-DDTHH:MM:SS'; if the year is missing use 2026; if the log only has seconds-since-boot like '[ 1234.567890]', use 2026-01-01T00:00:00 plus that many seconds), kind, xid (int or None), pid (int or None), pci (str or None), msg (the message text, without timestamp/host prefix).
    'SXid' lines are nvswitch events, NOT GPU Xids. For JSON logs the text lives in the MESSAGE field.
-   GPU Xid line anatomy: 'NVRM: Xid (PCI:0000:41:00): 79, pid=1432, name=python, GPU has fallen off the bus.' - the Xid code is the integer right AFTER the parenthesised PCI address (79 here), not the PCI digits; pid may be missing or quoted like '<unknown>' (then pid=None).
+   Example of the classic NVIDIA Xid line: 'NVRM: Xid (PCI:0000:41:00): 79, pid=1432, name=python, GPU has fallen off the bus.' (code 79; pid may be '<unknown>' -> None). Formats change between driver versions and log collectors: rely on the sample lines you are shown, not on this example. The Xid code is an integer that is not part of the PCI address.
  kind='telemetry': return one dict per sample row (skip headers / '#' lines). Keys: ts (ISO), gpu (int), temp_c, power_w, sm_clock_mhz,
    ecc_sbe, ecc_dbe, remapped_rows, remap_failures, nvlink_crc, pcie_replay (all numbers, cumulative counters). Map vendor names (e.g. DCGM_FI_DEV_*) to these keys.
 
@@ -78,25 +80,36 @@ def triage(incident: dict, model: str = DEFAULT_MODEL, lib: Library | None = Non
     client, files = _client(), dict(incident["files"])
     parsed, source, fps, attempts = {}, {}, {}, {"log": 0, "telemetry": 0}
     seen, calls, report, tokens, t0, errors, analysed = "", 0, None, 0, time.time(), [], False
+    stale, fails, lessons_added, reviews = {}, {"log": [], "telemetry": []}, 0, 0
 
     # ---- Phase 0: try the library before spending a single LLM token on parsing
     for kind, fname in FILES.items():
         fps[kind] = fingerprint(files[fname])
-        e = lib.lookup(kind, fps[kind]) if use_library else None
-        if not e: continue
-        res = check(kind, e["code"], files[fname])
-        if res["ok"]:
-            parsed[kind], source[kind] = res["data"], f"library:{e['name']}"
-            files["events.json" if kind == "log" else "telemetry.json"] = json.dumps(res["data"])
-            lib.record_use(kind, fps[kind]); seen += json.dumps(res["summary"])
-            yield {"type": "library_hit", "kind": kind, "name": e["name"], "fingerprint": fps[kind], "summary": res["summary"]}
-        else:
+        for e in (lib.candidates(kind, fps[kind])[:MAX_CANDIDATES] if use_library else []):
+            res = check(kind, e["code"], files[fname])          # the validator, not the fingerprint, decides
+            if res["ok"]:
+                parsed[kind], source[kind] = res["data"], f"library:{e['name']}"
+                files["events.json" if kind == "log" else "telemetry.json"] = json.dumps(res["data"])
+                lib.record_use(e["name"]); seen += json.dumps(res["summary"])
+                yield {"type": "library_hit", "kind": kind, "name": e["name"], "fingerprint": fps[kind],
+                       "exact_fingerprint": e["fingerprint"] == fps[kind], "summary": res["summary"]}
+                break
+            stale.setdefault(kind, {"name": e["name"], "code": e["code"], "problems": res["problems"]})   # best-ranked failing candidate = repair starting point
             yield {"type": "library_stale", "kind": kind, "name": e["name"], "problems": res["problems"]}
 
     need = [k for k in FILES if k not in parsed]
+    def _need(k):
+        s = f"- {k}: NEEDS PARSER. fingerprint={fps[k]}. First lines of {FILES[k]}:\n{_head(files[FILES[k]])}"
+        ls = lib.lessons(k) if use_library else []
+        if ls: s += "\n  Lessons from past parser-writing mistakes (apply them):\n" + "\n".join(f"  * {l['text']}" for l in ls)
+        if k in stale:
+            s += (f"\n  REPAIR HINT: the saved parser '{stale[k]['name']}' no longer validates on this file ({'; '.join(stale[k]['problems'])[:500]}). "
+                  f"The format has probably drifted. Adapt it rather than starting over, and keep it working for the old format too:\n{stale[k]['code'][:2500]}")
+        return s
     brief = incident["alert"] + "\n\nParser status:\n" + "\n".join(
-        (f"- {k}: READY (reused from library, validated)" if k in parsed else
-         f"- {k}: NEEDS PARSER. fingerprint={fps[k]}. First lines of {FILES[k]}:\n{_head(files[FILES[k]])}") for k in FILES)
+        (f"- {k}: READY (reused from library, validated)" if k in parsed else _need(k)) for k in FILES)
+    for k in stale:
+        if k not in parsed: yield {"type": "repair_context", "kind": k, "name": stale[k]["name"], "problems": stale[k]["problems"]}
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": brief}]
 
     for step in range(1, MAX_STEPS + 1):
@@ -130,15 +143,27 @@ def triage(incident: dict, model: str = DEFAULT_MODEL, lib: Library | None = Non
                     res = check(kind, args.get("code", ""), files[FILES[kind]])
                     yield {"type": "parser_attempt", "step": step, "kind": kind, "attempt": attempts[kind], "ok": res["ok"], "code": args.get("code", ""),
                            "problems": res["problems"], "summary": res.get("summary")}
+                    rev = None
                     if res["ok"]:
-                        name_saved = lib.save(kind, fps[kind], args["code"], args.get("description", ""))
-                        parsed[kind], source[kind] = res["data"], f"learned:{name_saved}"
+                        rev = rv.review(client, model, kind, files[FILES[kind]], res["data"]); tokens += rev.get("tokens", 0); reviews += 1
+                        yield {"type": "parser_review", "kind": kind, "verdict": rev["verdict"], "issues": rev["issues"]}
+                        if rev["verdict"] == "fail":
+                            res = {**res, "ok": False, "problems": ["Reviewer (independent model check of the output against the raw lines) found: " + " | ".join(rev["issues"])]}
+                    if res["ok"]:
+                        repaired = kind in stale
+                        name_saved = lib.save(kind, fps[kind], args["code"], args.get("description", ""), "repaired" if repaired else "learned", stale[kind]["name"] if repaired else None)
+                        parsed[kind], source[kind] = res["data"], f"{'repaired' if repaired else 'learned'}:{name_saved}"
                         files["events.json" if kind == "log" else "telemetry.json"] = json.dumps(res["data"])
                         seen += json.dumps(res["summary"])
-                        yield {"type": "parser_saved", "kind": kind, "name": name_saved, "fingerprint": fps[kind]}
+                        yield {"type": "parser_saved", "kind": kind, "name": name_saved, "fingerprint": fps[kind], "repaired": repaired}
+                        if fails[kind] and use_library:
+                            text, tok = rv.reflect(client, model, kind, fails[kind], args["code"], repaired); tokens += tok
+                            if text and lib.add_lesson(kind, fps[kind], text):
+                                lessons_added += 1; yield {"type": "lesson_saved", "kind": kind, "text": text}
                         out = {"status": "VALIDATED and saved to library", "summary": res["summary"], "file_written": "events.json" if kind == "log" else "telemetry.json"}
                     else:
-                        out = {"status": "REJECTED by validator", "problems": res["problems"], "attempt": attempts[kind], "of": MAX_PARSER_ATTEMPTS}
+                        fails[kind].append("; ".join(res["problems"])[:400])
+                        out = {"status": "REJECTED", "problems": res["problems"], "attempt": attempts[kind], "of": MAX_PARSER_ATTEMPTS}
             elif name == "run_python":
                 yield {"type": "code", "step": step, "code": args.get("code", "")}
                 out = sandbox.run_python(args.get("code", ""), files)
@@ -168,7 +193,7 @@ def triage(incident: dict, model: str = DEFAULT_MODEL, lib: Library | None = Non
         if done: break
     phash = hashlib.sha1(json.dumps(parsed, sort_keys=True).encode()).hexdigest()[:10] if len(parsed) == 2 else None
     yield {"type": "done", "seconds": round(time.time() - t0, 1), "tool_calls": calls, "tokens": tokens, "model": model,
-           "parsers": source, "parser_attempts": dict(attempts), "parsed_hash": phash, "errors": errors, "steps_used": step if "step" in dir() else 0, "report": report.model_dump() if report else None}
+           "parsers": source, "parser_attempts": dict(attempts), "reviews": reviews, "lessons_added": lessons_added, "repair_used": [k for k in stale if k in parsed and source[k].startswith("repaired")], "parsed_hash": phash, "errors": errors, "steps_used": step if "step" in dir() else 0, "report": report.model_dump() if report else None}
 
 def run_to_end(incident, model=DEFAULT_MODEL, lib=None, use_library=True):
     last = None
