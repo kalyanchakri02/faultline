@@ -15,7 +15,7 @@ FORMATS = [("syslog", "csv"), ("journal_iso", "dcgm_jsonl"), ("journal_json", "d
 
 def _ts(t): return t.strftime("%b %d %H:%M:%S")
 
-def generate(name: str, seed: int = 7, fmt_id: int = 0):
+def generate(name: str, seed: int = 7, fmt_id: int = 0, xid_style: str = "v1"):
     r = random.Random(f"{name}-{seed}")
     t0 = dt.datetime(2026, 10, 20, 2, 0, 0)
     host = f"gpu-node-{r.randint(100,999)}"
@@ -76,6 +76,7 @@ def generate(name: str, seed: int = 7, fmt_id: int = 0):
             trows.append(dict(ts=(t0+dt.timedelta(minutes=m)), temp=round(temp, 1), power=round(power), sm=sm, sbe=sbe, dbe=dbe,
                               remap=remap, rfail=rfail, crc=crc, replay=replay))
 
+    if xid_style != "v1": log = [_restyle(l, xid_style) for l in log]
     log.sort(key=lambda s: dt.datetime.strptime("2026 " + s[:15], "%Y %b %d %H:%M:%S"))
     log_fmt, telem_fmt = FORMATS[fmt_id % len(FORMATS)]
     return {
@@ -84,6 +85,16 @@ def generate(name: str, seed: int = 7, fmt_id: int = 0):
         "truth": SCENARIOS[name],
         "alert": f"Alert on {host} GPU{gpu} ({pci}): job failures / GPU health check failed. Files: dmesg.log (kernel/system log), dcgm_telemetry.txt (5-min DCGM samples). Formats are not guaranteed.",
     }
+
+_XID_V1 = re.compile(r"NVRM: Xid \(PCI:([^)]*)\): (\d+), pid=([^,]+), name=([^,]+), (.*)")
+
+def _restyle(line, style):
+    """HYPOTHETICAL future Xid wordings, used only to test format drift (not real NVIDIA formats)."""
+    m = _XID_V1.search(line)
+    if not m: return line
+    pci, code, pid, name, msg = m.groups(); head = line[:m.start()]
+    if style == "v2": return f"{head}NVRM: GPU {pci} reported Xid {code} (pid {pid}, {name}) - {msg}"
+    return f"{head}NVRM: Xid error code={code} dev={pci} pid={pid} proc={name}: {msg}"
 
 _SYSLOG = re.compile(r"^(\w{3} +\d+ \d\d:\d\d:\d\d) (\S+) ([^:]+): (.*)$")
 
