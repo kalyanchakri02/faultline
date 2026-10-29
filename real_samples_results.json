@@ -1,0 +1,47 @@
+{
+ "netdata_xid79": {
+  "parsers": {
+   "log": "learned:log_272727d1_v1",
+   "telemetry": "learned:telemetry_fe8adfab_v1"
+  },
+  "attempts": {
+   "log": 1,
+   "telemetry": 1
+  },
+  "seconds": 21.3,
+  "tokens": 32292,
+  "classification": "pcie",
+  "action": "drain_reboot",
+  "root_cause": "Single Xid 79 indicating GPU fell off the bus due to PCIe error, with no memory or thermal anomalies."
+ },
+ "crusoe_xid79_unknown_pid": {
+  "parsers": {
+   "log": "library:log_272727d1_v1",
+   "telemetry": "library:telemetry_fe8adfab_v1"
+  },
+  "attempts": {
+   "log": 0,
+   "telemetry": 0
+  },
+  "seconds": 8.4,
+  "tokens": 8976,
+  "classification": "pcie",
+  "action": "drain_reboot",
+  "root_cause": "PCIe link loss causing GPU to fall off the bus (Xid 79)"
+ },
+ "crusoe_xid95_uncontained": {
+  "parsers": {
+   "log": "library:log_272727d1_v1",
+   "telemetry": "library:telemetry_fe8adfab_v1"
+  },
+  "attempts": {
+   "log": 0,
+   "telemetry": 0
+  },
+  "seconds": 9.6,
+  "tokens": 9167,
+  "classification": "memory",
+  "action": "gpu_reset",
+  "root_cause": "Single uncontained ECC error (Xid 95) indicating a memory error that requires GPU reset."
+ }
+}

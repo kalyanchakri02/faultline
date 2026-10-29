@@ -1,0 +1,67 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaultLine</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#2a313c;--fg:#e6edf3;--mut:#8b949e;--acc:#76b900;--bad:#f85149;--warn:#d29922;--ok:#3fb950}
+@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--line:#d0d7de;--fg:#1f2328;--mut:#656d76;--acc:#4c7a00}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+h1{margin:0;font-size:22px}h1 span{color:var(--acc)}.sub{color:var(--mut)}
+main{display:grid;grid-template-columns:320px 1fr;gap:16px;padding:16px 24px;max-width:1300px;margin:auto}
+@media(max-width:800px){main{grid-template-columns:1fr;padding:16px}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.panel h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+button.sc{display:block;width:100%;text-align:left;margin:0 0 8px;padding:10px 12px;background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:8px;cursor:pointer;font:inherit}
+button.sc:hover,button.sc.on{border-color:var(--acc)}button:disabled{opacity:.5;cursor:wait}
+pre{margin:6px 0 0;padding:10px;background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:auto;font:12.5px/1.45 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.step{border-left:3px solid var(--line);padding:2px 0 2px 12px;margin:0 0 14px}.step.code{border-color:var(--acc)}.step.res{border-color:var(--mut)}.step.look{border-color:var(--warn)}.step.rej{border-color:var(--bad)}
+.tag{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+.report{border:2px solid var(--acc);border-radius:10px;padding:14px;margin-top:8px}
+.pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:13px;font-weight:600;margin:0 6px 6px 0;border:1px solid var(--line)}
+.pill.act{background:var(--acc);color:#0e1116;border-color:var(--acc)}.pill.crit,.pill.high{color:var(--bad);border-color:var(--bad)}
+ul{margin:6px 0 0;padding-left:20px}.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+</style></head><body>
+<header><h1>Fault<span>Line</span></h1><span class="sub">Coding agent for GPU node triage · Nemotron on Nebius Token Factory</span></header>
+<main>
+<aside class="panel"><h2>Log format (unseen = agent must learn)</h2><select id="fmt" style="width:100%;margin:0 0 14px;padding:8px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px"></select>
+<h2>Incident scenarios</h2><div id="list"></div>
+<h2 style="margin-top:16px">Parser library <button id="reset" style="float:right;font-size:11px;background:none;color:var(--mut);border:1px solid var(--line);border-radius:6px;cursor:pointer">reset</button></h2><div id="lib" class="mut">empty</div>
+<h2 style="margin-top:16px">Alert</h2><div id="alert" class="mut">Pick a scenario to start a triage.</div><pre id="tail" hidden></pre></aside>
+<section class="panel"><h2>Agent trace <span id="status" class="mut"></span></h2><div id="trace"><span class="mut">Waiting…</span></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);let es=null;
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function loadLib(){const l=await (await fetch('/api/library')).json();$('lib').innerHTML=l.length?l.map(e=>`<div style="margin-bottom:6px"><b>${esc(e.kind)}</b> <span class="mut">${esc(e.name)} · v${e.version} · reused ${e.uses}×</span><div class="mut" style="font-size:12px">${esc(e.description)}</div></div>`).join(''):'empty - the agent will learn parsers as it meets formats'}
+$('reset').onclick=async()=>{await fetch('/api/library/reset',{method:'POST'});loadLib()};loadLib();
+fetch('/api/scenarios').then(r=>r.json()).then(({scenarios:l,formats})=>{formats.forEach(f=>{const o=document.createElement('option');o.value=f.id;o.textContent=`${f.log}  +  ${f.telemetry}`;$('fmt').appendChild(o)});l.forEach(s=>{const b=document.createElement('button');b.className='sc';b.textContent=s.title;b.onclick=()=>run(s.id,b);$('list').appendChild(b)})});
+async function run(id,btn){
+  if(es)es.close();document.querySelectorAll('button.sc').forEach(b=>{b.classList.remove('on')});btn.classList.add('on');
+  $('trace').innerHTML='';$('status').textContent='· running…';
+  const fmt=$('fmt').value;const inc=await (await fetch('/api/incident/'+id+'?fmt='+fmt)).json();
+  $('alert').textContent=inc.alert;$('tail').hidden=false;$('tail').textContent=inc.log_head.join('\n')+'\n…\n'+inc.telemetry_head.join('\n');
+  document.querySelectorAll('button.sc').forEach(b=>b.disabled=true);
+  const add=h=>{const d=document.createElement('div');d.innerHTML=h;$('trace').appendChild(d.firstElementChild);window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})};
+  let truth=null,rep=null;
+  es=new EventSource('/api/triage/'+id+'?fmt='+fmt);
+  es.onmessage=m=>{const e=JSON.parse(m.data);
+    if(e.type==='thought')add(`<div class="step"><div class="tag">Step ${e.step} · thinking</div>${esc(e.text)}</div>`);
+    else if(e.type==='library_hit')add(`<div class="step res"><div class="tag">library hit · ${esc(e.kind)} parser reused</div><b>${esc(e.name)}</b> <span class="mut">validated against the raw file: ${esc(JSON.stringify(e.summary))}</span></div>`);
+    else if(e.type==='library_stale')add(`<div class="step rej"><div class="tag">library parser failed validation - agent must rewrite</div>${esc(e.name)}: ${esc((e.problems||[]).join(' | ')).slice(0,300)}</div>`);
+    else if(e.type==='parser_attempt')add(`<div class="step ${e.ok?'code':'rej'}"><div class="tag">agent wrote a ${esc(e.kind)} parser · attempt ${e.attempt} · ${e.ok?'PASSED validator':'REJECTED by validator'}</div>${e.ok?esc(JSON.stringify(e.summary)):esc((e.problems||[]).join(' | ')).slice(0,400)}<details><summary class="mut">parser code</summary><pre>${esc(e.code)}</pre></details></div>`);
+    else if(e.type==='parser_saved'){add(`<div class="step code"><div class="tag">saved to library</div><b>${esc(e.name)}</b> <span class="mut">will be reused for this format</span></div>`);loadLib()}
+    else if(e.type==='code')add(`<div class="step code"><div class="tag">Step ${e.step} · agent wrote code</div><pre>${esc(e.code)}</pre></div>`);
+    else if(e.type==='result')add(`<div class="step res"><div class="tag">sandbox output · exit ${e.exit_code}</div><pre>${esc(e.stdout+(e.stderr?'\n[stderr]\n'+e.stderr:''))||'(no output)'}</pre></div>`);
+    else if(e.type==='lookup')add(`<div class="step look"><div class="tag">lookup_xid(${e.xid})</div>${esc(e.name||e.error)} — <span class="mut">${esc(e.guidance||'')}</span></div>`);
+    else if(e.type==='rejected')add(`<div class="step rej"><div class="tag">report rejected — agent must fix</div><pre>${esc(e.errors)}</pre></div>`);
+    else if(e.type==='error')add(`<div class="step rej"><div class="tag">error</div>${esc(e.message)}</div>`);
+    else if(e.type==='report'){rep=e.report;const r=e.report;add(`<div class="report"><div class="tag">Triage report</div>
+      <span class="pill">${esc(r.classification)}</span><span class="pill ${r.severity}">severity: ${esc(r.severity)}</span><span class="pill act">${esc(r.action.replaceAll('_',' '))}</span><span class="pill">confidence ${(r.confidence*100).toFixed(0)}%</span>
+      <p>${esc(r.root_cause)}</p><b>Evidence</b><ul>${r.evidence.map(x=>`<li>${esc(x)}</li>`).join('')}</ul><div id="truth" class="mut" style="margin-top:8px"></div></div>`)}
+    else if(e.type==='truth')truth=e.truth;
+    else if(e.type==='done'){$('status').textContent=`· done in ${e.seconds}s, ${e.tool_calls} tool calls, ${e.tokens} tokens · ${e.model}`;loadLib();
+      if(truth&&rep&&$('truth'))$('truth').innerHTML=`Ground truth: ${esc(truth.classification)} / ${esc(truth.action)} → <span class="${rep.classification===truth.classification&&rep.action===truth.action?'ok':'bad'}">${rep.classification===truth.classification&&rep.action===truth.action?'match':'differs'}</span>`}
+  };
+  es.addEventListener('error',()=>{});
+  es.onerror=()=>{es.close();document.querySelectorAll('button.sc').forEach(b=>b.disabled=false)};
+}
+</script></body></html>
